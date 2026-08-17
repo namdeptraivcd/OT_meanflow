@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid, save_image
@@ -68,6 +67,15 @@ def unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
+def average_gradients(model, world):
+    if world <= 1 or not dist.is_available() or not dist.is_initialized():
+        return
+    for p in model.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.div_(world)
+
+
 def sample_r_t(b, device, ratio):
     a = torch.rand(b, device=device)
     c = torch.rand(b, device=device)
@@ -123,7 +131,7 @@ def model_forward(model, z, r, t):
     return model(z, r, t)
 
 
-def train_step(args, model, opt, batch, device):
+def train_step(args, model, opt, batch, device, world=1):
     x = batch[0].to(device, non_blocking=True)
     e = torch.randn_like(x)
     b = x.shape[0]
@@ -154,6 +162,7 @@ def train_step(args, model, opt, batch, device):
 
     opt.zero_grad(set_to_none=True)
     loss.backward()
+    average_gradients(unwrap(model), world)
     opt.step()
     return loss.detach()
 
@@ -261,8 +270,6 @@ def main():
     batches = infinite_loader(loader, sampler)
 
     model = SmallUNet(base_ch=args.base_ch, time_dim=args.time_dim).to(device)
-    if ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     opt = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr, weight_decay=0.0)
     ema = EMA(unwrap(model), decay=args.ema)
 
@@ -282,7 +289,7 @@ def main():
             torch.cuda.reset_peak_memory_stats(device)
             torch.cuda.synchronize(device)
         s0 = time.time()
-        loss = train_step(args, model, opt, next(batches), device)
+        loss = train_step(args, model, opt, next(batches), device, world=world)
         ema.update(unwrap(model))
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
