@@ -81,38 +81,36 @@ class SmallUNet(nn.Module):
             nn.Linear(time_dim * 4, time_dim),
         )
 
-        self.in_conv = nn.Conv2d(in_ch, base_ch, 3, padding=1)
+        ch0 = base_ch
+        ch1 = base_ch * 2
+        ch2 = base_ch * 2
 
-        ch = base_ch
-        self.down_blocks = nn.ModuleList()
-        self.downsamples = nn.ModuleList()
-        skips = [ch]
-        for level, mult in enumerate(channel_mults):
-            out = base_ch * mult
-            self.down_blocks.append(ResBlock(ch, out, time_dim, dropout))
-            ch = out
-            self.down_blocks.append(ResBlock(ch, out, time_dim, dropout))
-            skips.extend([ch, ch])
-            if level != len(channel_mults) - 1:
-                self.downsamples.append(Downsample(ch))
-                skips.append(ch)
+        self.in_conv = nn.Conv2d(in_ch, ch0, 3, padding=1)
 
-        self.mid1 = ResBlock(ch, ch, time_dim, dropout)
-        self.mid2 = ResBlock(ch, ch, time_dim, dropout)
+        self.enc0_a = ResBlock(ch0, ch0, time_dim, dropout)  # 28x28
+        self.enc0_b = ResBlock(ch0, ch0, time_dim, dropout)
+        self.down0 = Downsample(ch0)  # 14x14
 
-        self.up_blocks = nn.ModuleList()
-        self.upsamples = nn.ModuleList()
-        for level, mult in reversed(list(enumerate(channel_mults))):
-            out = base_ch * mult
-            for _ in range(2):
-                skip_ch = skips.pop()
-                self.up_blocks.append(ResBlock(ch + skip_ch, out, time_dim, dropout))
-                ch = out
-            if level != 0:
-                self.upsamples.append(Upsample(ch))
+        self.enc1_a = ResBlock(ch0, ch1, time_dim, dropout)
+        self.enc1_b = ResBlock(ch1, ch1, time_dim, dropout)
+        self.down1 = Downsample(ch1)  # 7x7
 
-        self.out_norm = nn.GroupNorm(min(8, ch), ch)
-        self.out_conv = nn.Conv2d(ch, out_ch, 3, padding=1)
+        self.enc2_a = ResBlock(ch1, ch2, time_dim, dropout)
+        self.enc2_b = ResBlock(ch2, ch2, time_dim, dropout)
+
+        self.mid1 = ResBlock(ch2, ch2, time_dim, dropout)
+        self.mid2 = ResBlock(ch2, ch2, time_dim, dropout)
+
+        self.up1 = Upsample(ch2)  # 14x14
+        self.dec1_a = ResBlock(ch2 + ch1, ch1, time_dim, dropout)
+        self.dec1_b = ResBlock(ch1, ch1, time_dim, dropout)
+
+        self.up0 = Upsample(ch1)  # 28x28
+        self.dec0_a = ResBlock(ch1 + ch0, ch0, time_dim, dropout)
+        self.dec0_b = ResBlock(ch0, ch0, time_dim, dropout)
+
+        self.out_norm = nn.GroupNorm(min(8, ch0), ch0)
+        self.out_conv = nn.Conv2d(ch0, out_ch, 3, padding=1)
 
     def make_temb(self, r, t):
         if r.ndim == 0:
@@ -128,27 +126,23 @@ class SmallUNet(nn.Module):
 
     def forward(self, z, r, t):
         temb = self.make_temb(r, t)
-        h = self.in_conv(z)
-        hs = [h]
-        down_i = 0
-        for block_i, block in enumerate(self.down_blocks):
-            h = block(h, temb)
-            hs.append(h)
-            if block_i % 2 == 1 and down_i < len(self.downsamples):
-                h = self.downsamples[down_i](h)
-                hs.append(h)
-                down_i += 1
+        h0 = self.in_conv(z)
+        h0 = self.enc0_b(self.enc0_a(h0, temb), temb)
 
+        h1 = self.down0(h0)
+        h1 = self.enc1_b(self.enc1_a(h1, temb), temb)
+
+        h = self.down1(h1)
+        h = self.enc2_b(self.enc2_a(h, temb), temb)
         h = self.mid2(self.mid1(h, temb), temb)
 
-        up_i = 0
-        for block_i, block in enumerate(self.up_blocks):
-            h = torch.cat([h, hs.pop()], dim=1)
-            h = block(h, temb)
-            if block_i % 2 == 1 and up_i < len(self.upsamples):
-                h = self.upsamples[up_i](h)
-                up_i += 1
+        h = self.up1(h)
+        h = torch.cat([h, h1], dim=1)
+        h = self.dec1_b(self.dec1_a(h, temb), temb)
 
+        h = self.up0(h)
+        h = torch.cat([h, h0], dim=1)
+        h = self.dec0_b(self.dec0_a(h, temb), temb)
         return self.out_conv(F.silu(self.out_norm(h)))
 
 
@@ -212,4 +206,3 @@ class EMA:
         state = model.state_dict()
         for k, v in backup.items():
             state[k].copy_(v.to(state[k].device))
-
